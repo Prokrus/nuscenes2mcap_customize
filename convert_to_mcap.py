@@ -4,6 +4,7 @@ import math
 import os
 from pathlib import Path
 from typing import Dict, Tuple
+import cv2
 
 import numpy as np
 import rospy
@@ -290,15 +291,31 @@ def get_radar(data_path, sample_data, frame_id) -> PointCloud:
     msg.data = pc.pc_data.tobytes()
     return msg
 
-
-def get_camera(data_path, sample_data, frame_id):
+def point_project(camera_intrinsic, point):
+    img_point = np.matmul(camera_intrinsic, point)
+    if(abs(img_point[2]) <= 1e-10 ):
+        return [1, 1]
+    img_point = [int(img_point[0]/img_point[2]), int(img_point[1]/img_point[2])]
+    return img_point
+    
+def get_camera(nusc, data_path, sample_data, frame_id):
     jpg_filename = data_path / sample_data["filename"]
     msg = CompressedImage()
     msg.timestamp.FromMicroseconds(sample_data["timestamp"])
     msg.frame_id = frame_id
     msg.format = "jpeg"
-    with open(jpg_filename, "rb") as jpg_file:
-        msg.data = jpg_file.read()
+    img = cv2.imread(str(jpg_filename))
+    _, boxes, camera_intrinsic = nusc.get_sample_data(sample_data['token'])
+    for box in boxes:
+        box.center = box.center
+        box_img_center = point_project(camera_intrinsic, box.center.transpose())
+        last_name = box.name.split('.')[-1]
+        cv2.putText(img, last_name, box_img_center,cv2.FONT_HERSHEY_TRIPLEX, 1,[0,0,0],thickness=2)
+    array_encode = cv2.imencode(".jpg", img)[1]
+    bytes_encode = array_encode.tobytes()
+    msg.data = bytes_encode
+    # with open(jpg_filename, "rb") as jpg_file:
+    #     msg.data = jpg_file.read()
     return msg
 
 
@@ -375,6 +392,57 @@ def write_boxes_image_annotations(nusc, protobuf_writer, anns, sample_data, fram
 
     protobuf_writer.write_message(topic_ns + "/annotations", msg, ann.timestamp.ToNanoseconds())
 
+def generate_shift(min_v, max_v):
+    x_shift = np.random.rand()*(max_v - min_v) + min_v
+    z_shift = np.random.rand()*(max_v - min_v) + min_v
+    return [x_shift, 0.0, z_shift]
+    
+def write_predicted_boxes_image_annotations(nusc, protobuf_writer, anns, sample_data, frame_id, topic_ns, stamp):
+    # predicted annotation boxes
+    collector = Collector()
+    _, boxes, camera_intrinsic = nusc.get_sample_data(sample_data["token"])
+    for box in boxes:
+        # c = np.array(nusc.explorer.get_color(box.name)) / 255.0
+        c = [0.0, 0.0, 0.0]
+        box.center = box.center + generate_shift(-0.2, 0.2)
+        box.render(collector, view=camera_intrinsic, normalize=True, colors=(c, c, c))
+
+    msg = ImageAnnotations()
+
+    ann = msg.points.add()
+    ann.timestamp.FromMicroseconds(sample_data["timestamp"])
+    ann.type = PointsAnnotation.Type.LINE_LIST
+    ann.thickness = 2
+    for p in collector.points:
+        ann.points.add(x=p[0], y=p[1])
+    for c in collector.colors:
+        ann.outline_colors.add(r=c[0], g=c[1], b=c[2], a=1)
+
+    protobuf_writer.write_message(topic_ns + "/annotations_predict", msg, ann.timestamp.ToNanoseconds())
+
+def write_boxes_labels_image_annotations(nusc, protobuf_writer, anns, sample_data, frame_id, topic_ns, stamp):
+    # annotation boxes label
+    collector = Collector()
+    _, boxes, camera_intrinsic = nusc.get_sample_data(sample_data["token"])
+    # print(boxes)
+    msg = ImageAnnotations()
+    print(msg.__dict__)
+    ann = msg.circles.add()
+    ann.timestamp.FromMicroseconds(sample_data["timestamp"])
+    ann.font_size = 2
+    for box in boxes:
+        print(box)
+        print("==========================")
+        c = np.array(nusc.explorer.get_color(box.name)) / 255.0
+        box.render(collector, view=camera_intrinsic, normalize=True, colors=(c, c, c))
+
+
+    # for p in collector.points:
+    #     ann.points.add(x=p[0], y=p[1])
+    # for c in collector.colors:
+    #     ann.outline_colors.add(r=c[0], g=c[1], b=c[2], a=1)
+
+    # protobuf_writer.write_message(topic_ns + "/annotations", msg, ann.timestamp.ToNanoseconds())
 
 def write_drivable_area(protobuf_writer, nusc_map, ego_pose, stamp):
     translation = ego_pose["translation"]
@@ -782,7 +850,7 @@ def write_scene_to_mcap(nusc: NuScenes, nusc_can: NuScenesCanBus, scene, filepat
                     msg = get_lidar(data_path, sample_data, sensor_id)
                     protobuf_writer.write_message(topic, msg, stamp.to_nsec())
                 elif sample_data["sensor_modality"] == "camera":
-                    msg = get_camera(data_path, sample_data, sensor_id)
+                    msg = get_camera(nusc, data_path, sample_data, sensor_id)
                     protobuf_writer.write_message(topic + "/image_rect_compressed", msg, stamp.to_nsec())
                     msg = get_camera_info(nusc, sample_data, sensor_id)
                     protobuf_writer.write_message(topic + "/camera_info", msg, stamp.to_nsec())
@@ -799,7 +867,23 @@ def write_scene_to_mcap(nusc: NuScenes, nusc_can: NuScenesCanBus, scene, filepat
                         topic,
                         stamp,
                     )
-
+                    write_predicted_boxes_image_annotations(nusc,
+                        protobuf_writer,
+                        cur_sample["anns"],
+                        sample_data,
+                        sensor_id,
+                        topic,
+                        stamp,
+                    )
+                    # write_boxes_labels_image_annotations(nusc,
+                    #     protobuf_writer,
+                    #     cur_sample["anns"],
+                    #     sample_data,
+                    #     sensor_id,
+                    #     topic,
+                    #     stamp,
+                    # )
+                        
             # publish /pose
             pose_in_frame = PoseInFrame()
             pose_in_frame.timestamp.FromNanoseconds(stamp.to_nsec())
@@ -875,7 +959,7 @@ def write_scene_to_mcap(nusc: NuScenes, nusc_can: NuScenesCanBus, scene, filepat
                         msg = get_lidar(data_path, next_sample_data, sensor_id)
                         non_keyframe_sensor_msgs.append((msg.timestamp.ToNanoseconds(), topic, msg))
                     elif next_sample_data["sensor_modality"] == "camera":
-                        msg = get_camera(data_path, next_sample_data, sensor_id)
+                        msg = get_camera(nusc, data_path, next_sample_data, sensor_id)
                         camera_stamp_nsec = msg.timestamp.ToNanoseconds()
                         non_keyframe_sensor_msgs.append((camera_stamp_nsec, topic + "/image_rect_compressed", msg))
 
@@ -921,6 +1005,8 @@ def convert_all(
     nusc.list_scenes()
     for scene in nusc.scene:
         scene_name = scene["name"]
+        if scene_name != "scene-0103":
+            continue
         if selected_scenes is not None and scene_name not in selected_scenes:
             continue
         mcap_name = f"NuScenes-{name}-{scene_name}.mcap"
